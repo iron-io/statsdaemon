@@ -6,21 +6,21 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
-	"os"
 
 	"github.com/bmizerany/assert"
 )
 
-var	commonPercentiles = Percentiles{
-		&Percentile{
-			99,
-			"99",
-		},
-	}
+var commonPercentiles = Percentiles{
+	&Percentile{
+		99,
+		"99",
+	},
+}
 
 func TestMain(m *testing.M) {
 	configstr := []byte(`
@@ -29,7 +29,7 @@ func TestMain(m *testing.M) {
 		{
 	 		"regexp": ".*",
 	 		"threshold": 1000000000000000000,
-	 		"percent-thresholds": [25,75],
+	 		"percent-thresholds": [25,75,-75],
 	 		"count_persistence": false,
 	 		"func": ["mean","count","sum","upper"]
 		}
@@ -463,7 +463,6 @@ func TestProcessCounters(t *testing.T) {
 	var buffer bytes.Buffer
 	now := int64(1418052649)
 
-
 	counters["gorets"] = float64(123)
 
 	num := p.processCounters(&buffer, now)
@@ -496,10 +495,10 @@ func TestProcessTimers(t *testing.T) {
 	lines := bytes.Split(buffer.Bytes(), []byte("\n"))
 
 	assert.Equal(t, num, int64(1))
-	assert.Equal(t, string(lines[0]), "response_time.mean 20 1418052649")
+	assert.Equal(t, string(lines[0]), "response_time.upper_25 0 1418052649")
 	assert.Equal(t, string(lines[1]), "response_time.upper_75 30 1418052649")
-	assert.Equal(t, string(lines[2]), "response_time.upper_25 0 1418052649")
-	assert.Equal(t, string(lines[3]), "response_time.count 3 1418052649")
+	assert.Equal(t, string(lines[3]), "response_time.mean 20 1418052649")
+	assert.Equal(t, string(lines[4]), "response_time.count 3 1418052649")
 
 	num = p.processTimers(&buffer, now)
 	assert.Equal(t, num, int64(0))
@@ -604,7 +603,7 @@ func TestProcessTimersUpperPercentile(t *testing.T) {
 	lines := bytes.Split(buffer.Bytes(), []byte("\n"))
 
 	assert.Equal(t, num, int64(1))
-	assert.Equal(t, string(lines[0]), "response_time.upper_75 2 1418052649")
+	assert.Equal(t, string(lines[1]), "response_time.upper_75 2 1418052649")
 }
 
 func TestProcessTimersUpperPercentilePostfix(t *testing.T) {
@@ -613,7 +612,7 @@ func TestProcessTimersUpperPercentilePostfix(t *testing.T) {
 	timers = make(map[string]Float64Slice)
 	timers["postfix_response_time.test"] = []float64{0, 1, 2, 3}
 
-  p.AddTimerMetric("postfix_response_time.test")
+	p.AddTimerMetric("postfix_response_time.test")
 	now := int64(1418052649)
 
 	var buffer bytes.Buffer
@@ -622,13 +621,14 @@ func TestProcessTimersUpperPercentilePostfix(t *testing.T) {
 	lines := bytes.Split(buffer.Bytes(), []byte("\n"))
 
 	assert.Equal(t, num, int64(1))
-	assert.Equal(t, string(lines[0]), "postfix_response_time.upper_75.test 2 1418052649")
+	assert.Equal(t, string(lines[1]), "postfix_response_time.upper_75.test 2 1418052649")
 	flag.Set("postfix", "")
 }
 
 func TestProcessTimesLowerPercentile(t *testing.T) {
 	timers = make(map[string]Float64Slice)
 	timers["time"] = []float64{0, 1, 2, 3}
+	p.AddTimerMetric("time")
 
 	now := int64(1418052649)
 
@@ -638,7 +638,7 @@ func TestProcessTimesLowerPercentile(t *testing.T) {
 	lines := bytes.Split(buffer.Bytes(), []byte("\n"))
 
 	assert.Equal(t, num, int64(1))
-	assert.Equal(t, string(lines[0]), "time.lower_75 1 1418052649")
+	assert.Equal(t, string(lines[2]), "time.lower_75 1 1418052649")
 }
 
 func TestMultipleUDPSends(t *testing.T) {

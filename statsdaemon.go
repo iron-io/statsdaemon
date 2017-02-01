@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"math"
 	"net"
@@ -16,7 +17,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"io/ioutil"
 
 	"gopkg.in/inconshreveable/log15.v2"
 )
@@ -86,8 +86,6 @@ func sanitizeBucket(bucket string) string {
 	return string(b[:bl])
 }
 
-
-
 var config configuration
 
 var (
@@ -154,7 +152,7 @@ func packetHandler(s *Packet) {
 		if !ok {
 			var t Float64Slice
 			timers[s.Bucket] = t
-		  p.AddTimerMetric(s.Bucket)
+			p.AddTimerMetric(s.Bucket)
 		}
 		timers[s.Bucket] = append(timers[s.Bucket], s.ValFlt)
 	case "g":
@@ -250,8 +248,6 @@ func submit(deadline time.Time) error {
 
 	return nil
 }
-
-
 
 type MsgParser struct {
 	reader       io.Reader
@@ -476,9 +472,7 @@ func tcpListener() {
 	}
 }
 
-
-
-func readConfigFromFile (filename string) *[]byte {
+func readConfigFromFile(filename string) *[]byte {
 	configstr, err := ioutil.ReadFile(filename)
 	if err != nil {
 		return nil
@@ -487,8 +481,6 @@ func readConfigFromFile (filename string) *[]byte {
 	}
 	return &configstr
 }
-
-
 
 func main() {
 	flag.Parse()
