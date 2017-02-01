@@ -101,14 +101,11 @@ var (
 	deleteGauges      = flag.Bool("delete-gauges", true, "don't send values to graphite for inactive gauges, as opposed to sending the previous value")
 	persistCountKeys  = flag.Int64("persist-count-keys", 60, "number of flush-intervals to persist count keys")
 	receiveCounter    = flag.String("receive-counter", "", "Metric name for total metrics received per interval")
-	percentThreshold  = Percentiles{}
 	prefix            = flag.String("prefix", "", "Prefix for all stats")
 	postfix           = flag.String("postfix", "", "Postfix for all stats")
 )
 
 func init() {
-	flag.Var(&percentThreshold, "percent-threshold",
-		"percentile calculation for timers (0-100, may be given multiple times)")
 }
 
 var (
@@ -213,7 +210,7 @@ func submit(deadline time.Time) error {
 			log.Printf("WARNING: resetting counters when in debug mode")
 			p.processCounters(&buffer, now)
 			p.processGauges(&buffer, now)
-			p.processTimers(&buffer, now, percentThreshold)
+			p.processTimers(&buffer, now)
 			p.processSets(&buffer, now)
 		}
 		errmsg := fmt.Sprintf("dialing %s failed - %s", *graphiteAddress, err)
@@ -228,7 +225,7 @@ func submit(deadline time.Time) error {
 
 	num += p.processCounters(&buffer, now)
 	num += p.processGauges(&buffer, now)
-	num += p.processTimers(&buffer, now, percentThreshold)
+	num += p.processTimers(&buffer, now)
 	num += p.processSets(&buffer, now)
 	if num == 0 {
 		return nil

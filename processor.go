@@ -82,7 +82,7 @@ func (*processor) processSets(buffer *bytes.Buffer, now int64) int64 {
 	return num
 }
 
-func (*processor) processTimers(buffer *bytes.Buffer, now int64, pctls Percentiles) int64 {
+func (*processor) processTimers(buffer *bytes.Buffer, now int64) int64 {
 	var num int64
 	for bucket, timer := range timers {
 		bucketWithoutPostfix := bucket[:len(bucket)-len(*postfix)]
@@ -190,7 +190,7 @@ func (*processor) processTimers(buffer *bytes.Buffer, now int64, pctls Percentil
 }
 
 func (p *processor) AddTimerMetric(bucket string) {
-  for _, m := range config.Metrics {
+  for _, m := range p.config.Metrics {
     if m.RegexpCompiled.MatchString(bucket) {
       timersFlags[bucket] = true
       timersMetrics[bucket] = m
