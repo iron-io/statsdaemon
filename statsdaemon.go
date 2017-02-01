@@ -19,6 +19,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"io/ioutil"
 
 	"gopkg.in/inconshreveable/log15.v2"
 )
@@ -85,6 +86,12 @@ func sanitizeBucket(bucket string) string {
 	}
 	return string(b[:bl])
 }
+
+type configuration struct {
+	Metrics []Metric `json:"metrics"`
+}
+
+var config configuration
 
 var (
 	serviceAddress    = flag.String("address", ":8125", "UDP service address")
@@ -647,8 +654,30 @@ type Metric struct {
 	Functions         []string       `json:"func"`
 }
 
-var config struct {
-	Metrics []Metric `json:"metrics"`
+
+func readConfigFromFile (filename string) *[]byte {
+	configstr, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil
+		panic("error loading config")
+		log15.Error("Error loading config", "err", err)
+	}
+	return &configstr
+}
+
+func parseConfig(configstr *[]byte) (*configuration) {
+	c := new(configuration)
+	if err := json.Unmarshal(*configstr,&c); err !=nil {
+		log15.Error("Error creating config", "err", err)
+		return nil
+	}
+	for i, m := range c.Metrics {
+		compiled, err := regexp.Compile(m.Regexp)
+		if err == nil {
+			c.Metrics[i].RegexpCompiled = compiled
+		}
+	}
+	return c
 }
 
 func main() {
@@ -659,21 +688,7 @@ func main() {
 		return
 	}
 
-	file, err := os.Open("config.json")
-	if err != nil {
-		log15.Error("Error loading config", "err", err)
-		return
-	}
-	if err := json.NewDecoder(file).Decode(&config); err != nil {
-		log15.Error("couldn't parse config", "err", err)
-		return
-	}
-	for i, m := range config.Metrics {
-		compiled, err := regexp.Compile(m.Regexp)
-		if err == nil {
-			config.Metrics[i].RegexpCompiled = compiled
-		}
-	}
+	config = *parseConfig(readConfigFromFile("config.json"))
 
 	signalchan = make(chan os.Signal, 1)
 	signal.Notify(signalchan, syscall.SIGTERM)
