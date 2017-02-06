@@ -24,18 +24,18 @@ var commonPercentiles = Percentiles{
 
 func TestMain(m *testing.M) {
 	configstr := []byte(`
-	{
- 		"metrics": [
 		{
-	 		"regexp": ".*",
-	 		"threshold": 1000000000000000000,
-	 		"percent-thresholds": [25,75,-75],
-	 		"count_persistence": false,
-	 		"func": ["mean","count","sum","upper"]
+			"metrics": [
+				{
+					"regexp": ".*",
+					"threshold": 1000000000000000000,
+					"percent-thresholds": [25,75,-75],
+					"count_persistence": false,
+					"func": ["mean","count","sum","upper"]
+				}
+			]
 		}
-		]}
-
-		`)
+	`)
 	p = NewProcessor()
 	p.SetConfig(&configstr)
 	os.Exit(m.Run())

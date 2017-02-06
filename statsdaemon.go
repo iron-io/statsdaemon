@@ -475,9 +475,8 @@ func tcpListener() {
 func readConfigFromFile(filename string) *[]byte {
 	configstr, err := ioutil.ReadFile(filename)
 	if err != nil {
-		return nil
-		panic("error loading config")
 		log15.Error("Error loading config", "err", err)
+		return nil
 	}
 	return &configstr
 }
