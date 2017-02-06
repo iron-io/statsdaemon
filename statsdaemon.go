@@ -2,19 +2,17 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"math"
 	"net"
 	"os"
 	"os/signal"
-	"regexp"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -30,24 +28,21 @@ const (
 
 var signalchan chan os.Signal
 
+var p *processor
+
 type Packet struct {
 	Bucket   string
-	Value    interface{}
+	ValFlt   float64
+	ValStr   string
 	Modifier string
 	Sampling float32
 }
 
-type GaugeData struct {
-	Relative bool
-	Negative bool
-	Value    uint64
-}
+type Float64Slice []float64
 
-type Uint64Slice []uint64
-
-func (s Uint64Slice) Len() int           { return len(s) }
-func (s Uint64Slice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-func (s Uint64Slice) Less(i, j int) bool { return s[i] < s[j] }
+func (s Float64Slice) Len() int           { return len(s) }
+func (s Float64Slice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s Float64Slice) Less(i, j int) bool { return s[i] < s[j] }
 
 type Percentiles []*Percentile
 type Percentile struct {
@@ -91,6 +86,8 @@ func sanitizeBucket(bucket string) string {
 	return string(b[:bl])
 }
 
+var config configuration
+
 var (
 	serviceAddress    = flag.String("address", ":8125", "UDP service address")
 	tcpServiceAddress = flag.String("tcpaddr", "", "TCP service address, if set")
@@ -102,24 +99,19 @@ var (
 	deleteGauges      = flag.Bool("delete-gauges", true, "don't send values to graphite for inactive gauges, as opposed to sending the previous value")
 	persistCountKeys  = flag.Int64("persist-count-keys", 60, "number of flush-intervals to persist count keys")
 	receiveCounter    = flag.String("receive-counter", "", "Metric name for total metrics received per interval")
-	percentThreshold  = Percentiles{}
 	prefix            = flag.String("prefix", "", "Prefix for all stats")
 	postfix           = flag.String("postfix", "", "Postfix for all stats")
 )
 
 func init() {
-	flag.Var(&percentThreshold, "percent-threshold",
-		"percentile calculation for timers (0-100, may be given multiple times)")
 }
 
 var (
 	In              = make(chan *Packet, MAX_UNPROCESSED_PACKETS)
-	counters        = make(map[string]int64)
-	gauges          = make(map[string]uint64)
+	counters        = make(map[string]float64)
+	gauges          = make(map[string]float64)
+	timers          = make(map[string]Float64Slice)
 	lastGaugeValue  = make(map[string]uint64)
-	timers          = make(map[string]Uint64Slice)
-	timersFlags     = make(map[string]bool)
-	timersMetrics   = make(map[string]Metric)
 	countInactivity = make(map[string]int64)
 	sets            = make(map[string][]string)
 )
@@ -158,39 +150,30 @@ func packetHandler(s *Packet) {
 	case "ms":
 		_, ok := timers[s.Bucket]
 		if !ok {
-			var t Uint64Slice
+			var t Float64Slice
 			timers[s.Bucket] = t
-			for _, m := range config.Metrics {
-				if m.RegexpCompiled.MatchString(s.Bucket) {
-					timersFlags[s.Bucket] = true
-					timersMetrics[s.Bucket] = m
-					break
-				}
-			}
+			p.AddTimerMetric(s.Bucket)
 		}
-		timers[s.Bucket] = append(timers[s.Bucket], s.Value.(uint64))
+		timers[s.Bucket] = append(timers[s.Bucket], s.ValFlt)
 	case "g":
 		gaugeValue, _ := gauges[s.Bucket]
 
-		gaugeData := s.Value.(GaugeData)
-		if gaugeData.Relative {
-			if gaugeData.Negative {
-				// subtract checking for -ve numbers
-				if gaugeData.Value > gaugeValue {
-					gaugeValue = 0
-				} else {
-					gaugeValue -= gaugeData.Value
-				}
+		if s.ValStr == "" {
+			gaugeValue = s.ValFlt
+		} else if s.ValStr == "+" {
+			// watch out for overflows
+			if s.ValFlt > (math.MaxFloat64 - gaugeValue) {
+				gaugeValue = math.MaxFloat64
 			} else {
-				// watch out for overflows
-				if gaugeData.Value > (math.MaxUint64 - gaugeValue) {
-					gaugeValue = math.MaxUint64
-				} else {
-					gaugeValue += gaugeData.Value
-				}
+				gaugeValue += s.ValFlt
 			}
-		} else {
-			gaugeValue = gaugeData.Value
+		} else if s.ValStr == "-" {
+			// subtract checking for negative numbers
+			if s.ValFlt > gaugeValue {
+				gaugeValue = 0
+			} else {
+				gaugeValue -= s.ValFlt
+			}
 		}
 
 		gauges[s.Bucket] = gaugeValue
@@ -199,13 +182,13 @@ func packetHandler(s *Packet) {
 		if !ok {
 			counters[s.Bucket] = 0
 		}
-		counters[s.Bucket] += int64(float64(s.Value.(int64)) * float64(1/s.Sampling))
+		counters[s.Bucket] += s.ValFlt * float64(1/s.Sampling)
 	case "s":
 		_, ok := sets[s.Bucket]
 		if !ok {
 			sets[s.Bucket] = make([]string, 0)
 		}
-		sets[s.Bucket] = append(sets[s.Bucket], s.Value.(string))
+		sets[s.Bucket] = append(sets[s.Bucket], s.ValStr)
 	}
 }
 
@@ -223,10 +206,10 @@ func submit(deadline time.Time) error {
 	if err != nil {
 		if *debug {
 			log.Printf("WARNING: resetting counters when in debug mode")
-			processCounters(&buffer, now)
-			processGauges(&buffer, now)
-			processTimers(&buffer, now, percentThreshold)
-			processSets(&buffer, now)
+			p.processCounters(&buffer, now)
+			p.processGauges(&buffer, now)
+			p.processTimers(&buffer, now)
+			p.processSets(&buffer, now)
 		}
 		errmsg := fmt.Sprintf("dialing %s failed - %s", *graphiteAddress, err)
 		return errors.New(errmsg)
@@ -238,10 +221,10 @@ func submit(deadline time.Time) error {
 		return err
 	}
 
-	num += processCounters(&buffer, now)
-	num += processGauges(&buffer, now)
-	num += processTimers(&buffer, now, percentThreshold)
-	num += processSets(&buffer, now)
+	num += p.processCounters(&buffer, now)
+	num += p.processGauges(&buffer, now)
+	num += p.processTimers(&buffer, now)
+	num += p.processSets(&buffer, now)
 	if num == 0 {
 		return nil
 	}
@@ -264,182 +247,6 @@ func submit(deadline time.Time) error {
 	log.Printf("sent %d stats to %s", num, *graphiteAddress)
 
 	return nil
-}
-
-func processCounters(buffer *bytes.Buffer, now int64) int64 {
-	var num int64
-	// continue sending zeros for counters for a short period of time even if we have no new data
-	for bucket, value := range counters {
-		fmt.Fprintf(buffer, "%s %d %d\n", bucket, value, now)
-		delete(counters, bucket)
-		countInactivity[bucket] = 0
-		num++
-	}
-	for bucket, purgeCount := range countInactivity {
-		if purgeCount > 0 {
-			fmt.Fprintf(buffer, "%s %d %d\n", bucket, 0, now)
-			num++
-		}
-		countInactivity[bucket] += 1
-		if countInactivity[bucket] > *persistCountKeys {
-			delete(countInactivity, bucket)
-		}
-	}
-	return num
-}
-
-func processGauges(buffer *bytes.Buffer, now int64) int64 {
-	var num int64
-
-	for bucket, gauge := range gauges {
-		currentValue := gauge
-		lastValue, hasLastValue := lastGaugeValue[bucket]
-		var hasChanged bool
-
-		if gauge != math.MaxUint64 {
-			hasChanged = true
-		}
-
-		switch {
-		case hasChanged:
-			fmt.Fprintf(buffer, "%s %d %d\n", bucket, currentValue, now)
-			lastGaugeValue[bucket] = currentValue
-			gauges[bucket] = math.MaxUint64
-			num++
-		case hasLastValue && !hasChanged && !*deleteGauges:
-			fmt.Fprintf(buffer, "%s %d %d\n", bucket, lastValue, now)
-			num++
-		default:
-			continue
-		}
-	}
-	return num
-}
-
-func processSets(buffer *bytes.Buffer, now int64) int64 {
-	num := int64(len(sets))
-	for bucket, set := range sets {
-
-		uniqueSet := map[string]bool{}
-		for _, str := range set {
-			uniqueSet[str] = true
-		}
-
-		fmt.Fprintf(buffer, "%s %d %d\n", bucket, len(uniqueSet), now)
-		delete(sets, bucket)
-	}
-	return num
-}
-
-func processTimers(buffer *bytes.Buffer, now int64, pctls Percentiles) int64 {
-	var num int64
-	for bucket, timer := range timers {
-		bucketWithoutPostfix := bucket[:len(bucket)-len(*postfix)]
-		num++
-		if _, ok := timersFlags[bucketWithoutPostfix]; !ok {
-			log15.Debug("No metrics are configured for this bucket. Maybe you need block with regexp '.*' in the end of config. Ignoring calculations & continuing.", "bucket", bucketWithoutPostfix)
-			continue
-		}
-
-		var percentiles Percentiles
-		metric, metricExists := timersMetrics[bucketWithoutPostfix]
-		if metricExists {
-			percent := Percentiles{}
-			for _, percThr := range metric.PercentThresholds {
-				percent = append(percent, &Percentile{percThr, strconv.Itoa(int(percThr))})
-			}
-			percentiles = percent
-		}
-
-		sort.Sort(timer)
-		min := timer[0]
-		max := timer[len(timer)-1]
-		maxAtThreshold := max
-		count := len(timer)
-
-		var violationsCount int
-		sum := uint64(0)
-		for _, value := range timer {
-			sum += value
-			if metricExists && value > metric.Threshold {
-				violationsCount++
-			}
-		}
-		mean := float64(sum) / float64(len(timer))
-
-		sumF := float64(0)
-		for _, value := range timer {
-			sumF += math.Pow(float64(value)-mean, 2.0)
-		}
-		stDeviation := math.Sqrt(sumF / float64(len(timer)))
-
-		medianPosition := int(math.Floor(float64((len(timer)+1)/2.0) + 0.5))
-		if medianPosition >= count {
-			medianPosition = count - 1
-		}
-		median := timer[medianPosition]
-
-		for _, pct := range percentiles {
-			if len(timer) > 1 {
-				var abs float64
-				if pct.float >= 0 {
-					abs = pct.float
-				} else {
-					abs = 100 + pct.float
-				}
-				// poor man's math.Round(x):
-				// math.Floor(x + 0.5)
-				indexOfPerc := int(math.Floor(((abs / 100.0) * float64(count)) + 0.5))
-				if pct.float >= 0 {
-					indexOfPerc -= 1 // index offset=0
-				}
-				if indexOfPerc < 0 {
-					indexOfPerc = 0
-				}
-				maxAtThreshold = timer[indexOfPerc]
-			}
-
-			var tmpl string
-			var pctstr string
-			if pct.float >= 0 {
-				tmpl = "%s.upper_%s%s %d %d\n"
-				pctstr = pct.str
-			} else {
-				tmpl = "%s.lower_%s%s %d %d\n"
-				pctstr = pct.str[1:]
-			}
-
-			if _, ok := timersFlags[bucketWithoutPostfix]; ok {
-				fmt.Fprintf(buffer, tmpl, bucketWithoutPostfix, pctstr, *postfix, maxAtThreshold, now)
-			}
-		}
-
-		fmt.Fprintf(buffer, "%s.mean%s %f %d\n", bucketWithoutPostfix, *postfix, mean, now)
-
-		if metricExists {
-			for _, funcName := range metric.Functions {
-				switch funcName {
-				case "median":
-					fmt.Fprintf(buffer, "%s.median%s %d %d\n", bucketWithoutPostfix, *postfix, median, now)
-				case "std":
-					fmt.Fprintf(buffer, "%s.std%s %f %d\n", bucketWithoutPostfix, *postfix, stDeviation, now)
-				case "sum":
-					fmt.Fprintf(buffer, "%s.sum%s %d %d\n", bucketWithoutPostfix, *postfix, sum, now)
-				case "sla_violations":
-					fmt.Fprintf(buffer, "%s.sla_violations%s %d %d\n", bucketWithoutPostfix, *postfix, violationsCount, now)
-				case "upper":
-					fmt.Fprintf(buffer, "%s.upper%s %d %d\n", bucketWithoutPostfix, *postfix, max, now)
-				case "lower":
-					fmt.Fprintf(buffer, "%s.lower%s %d %d\n", bucketWithoutPostfix, *postfix, min, now)
-				case "count":
-					fmt.Fprintf(buffer, "%s.count%s %d %d\n", bucketWithoutPostfix, *postfix, count, now)
-				}
-			}
-		}
-
-		delete(timers, bucket)
-	}
-	return num
 }
 
 type MsgParser struct {
@@ -566,58 +373,39 @@ func parseLine(line []byte) *Packet {
 	}
 
 	var (
-		err   error
-		value interface{}
+		err      error
+		floatval float64
+		strval   string
 	)
 
 	switch typeCode {
 	case "c":
-		value, err = strconv.ParseInt(string(val), 10, 64)
+		floatval, err = strconv.ParseFloat(string(val), 64)
 		if err != nil {
-			log.Printf("ERROR: failed to ParseInt %s - %s", string(val), err)
+			log.Printf("ERROR: failed to ParseFloat %s - %s", string(val), err)
 			return nil
 		}
 	case "g":
-		var rel, neg bool
 		var s string
 
-		switch val[0] {
-		case '+':
-			rel = true
-			neg = false
+		if val[0] == '+' || val[0] == '-' {
+			strval = string(val[0])
 			s = string(val[1:])
-		case '-':
-			rel = true
-			neg = true
-			s = string(val[1:])
-		default:
-			rel = false
-			neg = false
+		} else {
 			s = string(val)
 		}
-
-		value, err = strconv.ParseUint(s, 10, 64)
+		floatval, err = strconv.ParseFloat(s, 64)
 		if err != nil {
-			valueFloat, err := strconv.ParseFloat(string(val), 64)
-			if err != nil {
-				log.Printf("ERROR: failed to ParseFloat for 'g' %s, %s - %s", name, string(val), err)
-				return nil
-			}
-			value = uint64(valueFloat)
+			log.Printf("ERROR: failed to ParseFloat %s - %s", string(val), err)
+			return nil
 		}
-
-		value = GaugeData{rel, neg, value.(uint64)}
 	case "s":
-		value = string(val)
+		strval = string(val)
 	case "ms":
-		value, err = strconv.ParseUint(string(val), 10, 64)
+		floatval, err = strconv.ParseFloat(string(val), 64)
 		if err != nil {
-			valueFloat, err := strconv.ParseFloat(string(val), 64)
-			if err != nil {
-				log.Printf("ERROR: failed to ParseFloat for 'ms' %s, %s - %s", name, string(val), err)
-				return nil
-			}
-			value = uint64(valueFloat)
+			log.Printf("ERROR: failed to ParseFloat %s - %s", string(val), err)
+			return nil
 		}
 	default:
 		log.Printf("ERROR: unrecognized type code %q", typeCode)
@@ -626,7 +414,8 @@ func parseLine(line []byte) *Packet {
 
 	return &Packet{
 		Bucket:   sanitizeBucket(*prefix + string(name) + *postfix),
-		Value:    value,
+		ValFlt:   floatval,
+		ValStr:   strval,
 		Modifier: typeCode,
 		Sampling: sampling,
 	}
@@ -683,17 +472,13 @@ func tcpListener() {
 	}
 }
 
-type Metric struct {
-	Regexp            string         `json:"regexp"`
-	RegexpCompiled    *regexp.Regexp `json:"-"`
-	Threshold         uint64         `json:"threshold"`
-	PercentThresholds []float64      `json:"percent-thresholds"`
-	CountPersistence  bool           `json:"count_persistence"`
-	Functions         []string       `json:"func"`
-}
-
-var config struct {
-	Metrics []Metric `json:"metrics"`
+func readConfigFromFile(filename string) *[]byte {
+	configstr, err := ioutil.ReadFile(filename)
+	if err != nil {
+		log15.Error("Error loading config", "err", err)
+		return nil
+	}
+	return &configstr
 }
 
 func main() {
@@ -704,21 +489,8 @@ func main() {
 		return
 	}
 
-	file, err := os.Open("config.json")
-	if err != nil {
-		log15.Error("Error loading config", "err", err)
-		return
-	}
-	if err := json.NewDecoder(file).Decode(&config); err != nil {
-		log15.Error("couldn't parse config", "err", err)
-		return
-	}
-	for i, m := range config.Metrics {
-		compiled, err := regexp.Compile(m.Regexp)
-		if err == nil {
-			config.Metrics[i].RegexpCompiled = compiled
-		}
-	}
+	p = NewProcessor()
+	p.SetConfig(readConfigFromFile("config.json"))
 
 	signalchan = make(chan os.Signal, 1)
 	signal.Notify(signalchan, syscall.SIGTERM)
